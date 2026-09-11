@@ -409,14 +409,14 @@ function SchoolYearsPanel({ workspace, onChanged, preview = false }: { workspace
     <PageIntro eyebrow="School setup" title="School years" text="Create a dated school year, make one active, then manage its roster and attendance. Archived years stay preserved." />
     {workspace.activeSchoolYear ? <div className="active-year-banner"><span>Active school year</span><strong>{workspace.activeSchoolYear.name}</strong><span>{workspace.activeSchoolYear.startDate} to {workspace.activeSchoolYear.endDate}</span></div> : <div className="no-active-year-banner" role="status"><strong>No active school year</strong><span>Choose an existing year below or create a new one. Attendance and imports are paused.</span></div>}
     <section className="table-card school-year-create">
-      <div className="table-card-head"><div><h2>Create a school year</h2><p>New years start inactive so you can review the dates before switching over.</p></div></div>
+      <div className="table-card-head"><div><h2>Create a school year</h2><p>New years start inactive so you can review the dates before switching over. Date ranges may overlap.</p></div></div>
       <div className="school-year-form"><label><span>Name</span><input className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. 2027–2028" /></label><label><span>Start date</span><input className="input" type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} /></label><label><span>End date</span><input className="input" type="date" min={startDate || undefined} value={endDate} onChange={(event) => setEndDate(event.target.value)} /></label><button className="primary-button" disabled={!name.trim() || !startDate || !endDate || startDate > endDate || busyId === 'new'} onClick={() => void create()}>{busyId === 'new' ? <span className="loading loading-spinner loading-sm" /> : <Plus size={17} aria-hidden="true" />} Create year</button></div>
     </section>
     <section className="table-card school-year-list">
       <div className="table-card-head"><div><h2>School year history</h2><p>Only one year can be active at a time.</p></div></div>
       {workspace.schoolYears.map((year) => <div className={`school-year-row ${year.archived ? 'year-archived' : ''}`} key={year.id}><div><strong>{year.name}</strong><span>{year.startDate} to {year.endDate}</span></div><span className={`year-status ${year.active ? 'year-active' : year.archived ? 'year-archived-status' : ''}`}>{year.active ? 'Active' : year.archived ? 'Archived' : 'Inactive'}</span><div className="school-year-actions">{!year.active && !year.archived && <button className="secondary-button" disabled={busyId === year.id} onClick={() => void activate(year)}>Make active</button>}{!year.archived && <button className="danger-button" disabled={busyId === year.id} onClick={() => void archive(year)}><Archive size={16} aria-hidden="true" /> Archive</button>}</div></div>)}
     </section>
-    {message && <p className={message.includes('could not') || message.includes('overlap') ? 'error-callout' : 'success-callout'} role="status">{message}</p>}
+    {message && <p className={message.includes('could not') ? 'error-callout' : 'success-callout'} role="status">{message}</p>}
   </section>
 }
 

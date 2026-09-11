@@ -289,8 +289,6 @@ export const createSchoolYear = createServerFn({ method: 'POST' })
   .handler(async ({ data }) => {
     if (data.startDate > data.endDate) throw new Error('The school year end date must be after its start date.')
     const database = getRawDb()
-    const overlap = await database.prepare('SELECT name FROM school_years WHERE NOT (end_date < ? OR start_date > ?) LIMIT 1').bind(data.startDate, data.endDate).first<{ name: string }>()
-    if (overlap) throw new Error(`Those dates overlap ${overlap.name}. School years cannot overlap.`)
     const now = new Date().toISOString()
     const schoolYearId = id()
     await database.prepare('INSERT INTO school_years (id, name, start_date, end_date, active, archived, created_at, updated_at) VALUES (?, ?, ?, ?, 0, 0, ?, ?)')
