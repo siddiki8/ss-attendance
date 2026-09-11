@@ -7,6 +7,7 @@ import { getRawDb } from './db'
 const statusSchema = z.enum(['P', 'L', 'A'])
 const id = () => crypto.randomUUID()
 const normalise = (name: string) => name.trim().toLocaleLowerCase().replace(/\s+/g, ' ')
+const normaliseClassName = (name: string) => name.trim().toLocaleLowerCase().replace(/\s+/g, ' ')
 
 type Row = Record<string, unknown>
 const rows = <T extends Row>(result: D1Result<unknown>): T[] => (result.results ?? []) as T[]
@@ -152,7 +153,7 @@ export const saveAttendanceSheet = createServerFn({ method: 'POST' })
         ON CONFLICT(sheet_id, student_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`)
         .bind(id(), finalSheetId, studentId, status, now, now))
     }
-    await database.batch(statements)
+    if (statements.length) await database.batch(statements)
     return { id: finalSheetId, savedAt: now }
   })
 
@@ -243,24 +244,39 @@ export const saveSchedule = createServerFn({ method: 'POST' })
 
 export const importStudents = createServerFn({ method: 'POST' })
   .middleware([adminMiddleware])
-  .validator(z.object({ rows: z.array(z.object({ displayName: z.string().trim().min(1).max(120), classId: z.string().min(1) })).min(1).max(1000) }))
+  .validator(z.object({ rows: z.array(z.object({ displayName: z.string().trim().min(1).max(120), className: z.string().trim().min(1).max(64) })).min(1).max(1000) }))
   .handler(async ({ data }) => {
     const database = getRawDb()
     const schoolYear = await getActiveSchoolYear(database)
     const now = new Date().toISOString()
     const seen = new Set<string>()
     const uniqueRows = data.rows.filter((student) => {
-      const key = `${student.classId}:${normalise(student.displayName)}`
+      const key = `${normaliseClassName(student.className)}:${normalise(student.displayName)}`
       if (seen.has(key)) return false
       seen.add(key)
       return true
     })
+    const knownClasses = rows<{ id: string; name: string; active: number }>(await database.prepare('SELECT id, name, active FROM classes').all())
+    const classByName = new Map(knownClasses.map((schoolClass) => [normaliseClassName(schoolClass.name), schoolClass]))
+    const newClasses = new Map<string, { id: string; name: string }>()
+    for (const student of uniqueRows) {
+      const classKey = normaliseClassName(student.className)
+      if (!classByName.has(classKey) && !newClasses.has(classKey)) newClasses.set(classKey, { id: id(), name: student.className.trim().replace(/\s+/g, ' ') })
+    }
+    const classIdFor = (className: string) => classByName.get(normaliseClassName(className))?.id ?? newClasses.get(normaliseClassName(className))?.id
+    if (!uniqueRows.every((student) => classIdFor(student.className))) throw new Error('A class could not be prepared for this import.')
     const existing = rows<{ normalized_name: string; class_id: string }>(await database.prepare('SELECT normalized_name, class_id FROM students WHERE school_year_id = ?').bind(schoolYear.id).all())
     const existingKeys = new Set(existing.map((student) => `${student.class_id}:${student.normalized_name}`))
-    const accepted = uniqueRows.filter((student) => !existingKeys.has(`${student.classId}:${normalise(student.displayName)}`))
-    await database.batch(accepted.map((student) => database.prepare('INSERT INTO students (id, display_name, normalized_name, class_id, school_year_id, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)')
-      .bind(id(), student.displayName.trim(), normalise(student.displayName), student.classId, schoolYear.id, now, now)))
-    return { created: accepted.length, skipped: data.rows.length - accepted.length }
+    const accepted = uniqueRows.filter((student) => !existingKeys.has(`${classIdFor(student.className)}:${normalise(student.displayName)}`))
+    const statements: D1PreparedStatement[] = [
+      ...[...newClasses.values()].map((schoolClass) => database.prepare('INSERT INTO classes (id, name, schedule_mode, active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)')
+        .bind(schoolClass.id, schoolClass.name, 'inherit', now, now)),
+      ...knownClasses.filter((schoolClass) => !schoolClass.active && uniqueRows.some((student) => normaliseClassName(student.className) === normaliseClassName(schoolClass.name))).map((schoolClass) => database.prepare('UPDATE classes SET active = 1, updated_at = ? WHERE id = ?').bind(now, schoolClass.id)),
+      ...accepted.map((student) => database.prepare('INSERT INTO students (id, display_name, normalized_name, class_id, school_year_id, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)')
+        .bind(id(), student.displayName.trim(), normalise(student.displayName), classIdFor(student.className), schoolYear.id, now, now)),
+    ]
+    if (statements.length) await database.batch(statements)
+    return { created: accepted.length, skipped: data.rows.length - accepted.length, classesCreated: newClasses.size }
   })
 
 export const createSchoolYear = createServerFn({ method: 'POST' })

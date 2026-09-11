@@ -438,7 +438,7 @@ function SchedulePanel({ workspace }: { workspace: Workspace }) {
 }
 
 function ImportPanel({ workspace, onChanged }: { workspace: Workspace; onChanged: () => Promise<void> }) {
-  const [preview, setPreview] = useState<Array<{ displayName: string; classId: string; error?: string }>>([])
+  const [preview, setPreview] = useState<Array<{ displayName: string; className: string; classExists: boolean; error?: string }>>([])
   const [message, setMessage] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
   const onFile = async (file?: File) => {
@@ -449,19 +449,25 @@ function ImportPanel({ workspace, onChanged }: { workspace: Workspace; onChanged
     const nameIndex = headers.findIndex((item) => ['name', 'student', 'student name', 'display_name'].includes(item))
     const classIndex = headers.findIndex((item) => ['class', 'grade', 'class name'].includes(item))
     if (nameIndex < 0 || classIndex < 0) { setMessage('Your CSV needs a name column and a class column.'); return }
-    const known = new Map(workspace.classes.map((item) => [item.name.toLowerCase(), item.id]))
-    setPreview(lines.slice(0, 1000).map((line) => { const parts = line.split(',').map((item) => item.trim()); const classId = known.get((parts[classIndex] ?? '').toLowerCase()) ?? ''; return { displayName: parts[nameIndex] ?? '', classId, error: !parts[nameIndex] ? 'Missing name' : !classId ? 'Class not found' : undefined } }))
+    const normaliseClass = (value: string) => value.trim().toLocaleLowerCase().replace(/\s+/g, ' ')
+    const known = new Set(workspace.classes.map((item) => normaliseClass(item.name)))
+    setPreview(lines.slice(0, 1000).map((line) => {
+      const parts = line.split(',').map((item) => item.trim())
+      const className = parts[classIndex] ?? ''
+      return { displayName: parts[nameIndex] ?? '', className, classExists: known.has(normaliseClass(className)), error: !parts[nameIndex] ? 'Missing name' : !className ? 'Missing class' : undefined }
+    }))
     setMessage('')
   }
   const validRows = preview.filter((row) => !row.error)
-  const commit = async () => { try { const result = await importStudents({ data: { rows: validRows.map(({ displayName, classId }) => ({ displayName, classId })) } }); setMessage(`${result.created} students added; ${result.skipped} duplicates skipped.`); setPreview([]); await onChanged() } catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Import could not be completed.') } }
+  const newClassCount = new Set(validRows.filter((row) => !row.classExists).map((row) => row.className.toLocaleLowerCase())).size
+  const commit = async () => { try { const result = await importStudents({ data: { rows: validRows.map(({ displayName, className }) => ({ displayName, className })) } }); setMessage(`${result.created} students added; ${result.classesCreated} ${result.classesCreated === 1 ? 'class' : 'classes'} created; ${result.skipped} duplicates skipped.`); setPreview([]); await onChanged() } catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Import could not be completed.') } }
   return <section className="content-section">
-    <PageIntro eyebrow="Bulk intake" title="Import students" text="Start with the template, fill in student names and existing class names, then upload the completed CSV." />
-    <div className="import-toolbar"><a className="secondary-button" href="/student-import-template.csv" download><Download size={17} aria-hidden="true" /> Download CSV template</a><span>Columns: name, class</span></div>
+    <PageIntro eyebrow="Bulk intake" title="Import students" text="Start with the template and upload it. New class names are created automatically with the school timetable." />
+    <div className="import-toolbar"><a className="secondary-button" href="/student-import-template.csv" download><Download size={17} aria-hidden="true" /> Download CSV template</a><span>Columns: name, class · New classes are created automatically</span></div>
     <input className="hidden" ref={inputRef} type="file" accept=".csv,text/csv" onChange={(event) => void onFile(event.target.files?.[0])} />
     <button className="upload-zone" onClick={() => inputRef.current?.click()}><FileSpreadsheet size={30} aria-hidden="true" /><strong>Choose completed CSV</strong><span>Up to 1,000 rows · UTF-8 CSV</span></button>
     {message && <p className={message.includes('added') ? 'success-callout' : 'error-callout'}>{message}</p>}
-    {preview.length > 0 && <div className="table-card mt-6"><div className="table-card-head"><div><h2>Review {preview.length} rows</h2><p>{validRows.length} ready to import</p></div><button className="primary-button" disabled={!validRows.length} onClick={() => void commit()}>Import {validRows.length} students</button></div><div className="import-preview">{preview.slice(0, 30).map((row, index) => <div key={`${row.displayName}-${index}`} className={row.error ? 'import-row import-error' : 'import-row'}><span>{index + 1}</span><strong>{row.displayName || '—'}</strong><span>{workspace.classes.find((item) => item.id === row.classId)?.name ?? row.error}</span>{row.error ? <span className="text-error">Needs attention</span> : <Check className="text-success" size={17} />}</div>)}</div></div>}
+    {preview.length > 0 && <div className="table-card mt-6"><div className="table-card-head"><div><h2>Review {preview.length} rows</h2><p>{validRows.length} ready to import{newClassCount ? ` · ${newClassCount} new ${newClassCount === 1 ? 'class' : 'classes'} will be created` : ''}</p></div><button className="primary-button" disabled={!validRows.length} onClick={() => void commit()}>Import {validRows.length} students</button></div><div className="import-preview">{preview.slice(0, 30).map((row, index) => <div key={`${row.displayName}-${index}`} className={row.error ? 'import-row import-error' : 'import-row'}><span>{index + 1}</span><strong>{row.displayName || '—'}</strong><span>{row.error ?? (row.classExists ? row.className : `New class: ${row.className}`)}</span>{row.error ? <span className="text-error">Needs attention</span> : row.classExists ? <Check className="text-success" size={17} /> : <span className="new-class-label">Will create</span>}</div>)}</div></div>}
   </section>
 }
 
