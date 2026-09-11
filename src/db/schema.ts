@@ -15,6 +15,20 @@ export const schoolSettings = sqliteTable('school_settings', {
   ...timestamps,
 })
 
+export const schoolYears = sqliteTable('school_years', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  startDate: text('start_date').notNull(),
+  endDate: text('end_date').notNull(),
+  active: integer('active', { mode: 'boolean' }).notNull().default(false),
+  archived: integer('archived', { mode: 'boolean' }).notNull().default(false),
+  archivedAt: text('archived_at'),
+  ...timestamps,
+}, (table) => [
+  uniqueIndex('school_years_name_unique').on(table.name),
+  index('school_years_active_idx').on(table.active, table.archived),
+])
+
 export const meetingDays = sqliteTable('meeting_days', {
   id: text('id').primaryKey(),
   scheduleOwner: text('schedule_owner').notNull(),
@@ -46,17 +60,19 @@ export const students = sqliteTable('students', {
   displayName: text('display_name').notNull(),
   normalizedName: text('normalized_name').notNull(),
   classId: text('class_id').notNull().references(() => classes.id),
+  schoolYearId: text('school_year_id').notNull().references(() => schoolYears.id),
   active: integer('active', { mode: 'boolean' }).notNull().default(true),
   ...timestamps,
 }, (table) => [
   index('students_class_active_idx').on(table.classId, table.active),
-  uniqueIndex('students_name_class_unique').on(table.normalizedName, table.classId),
+  uniqueIndex('students_name_class_year_unique').on(table.normalizedName, table.classId, table.schoolYearId),
 ])
 
 export const attendanceSheets = sqliteTable('attendance_sheets', {
   id: text('id').primaryKey(),
   schoolDate: text('school_date').notNull(),
   classId: text('class_id').notNull().references(() => classes.id),
+  schoolYearId: text('school_year_id').notNull().references(() => schoolYears.id),
   periodId: text('period_id').notNull(),
   periodName: text('period_name').notNull(),
   periodOrder: integer('period_order').notNull(),
@@ -65,8 +81,8 @@ export const attendanceSheets = sqliteTable('attendance_sheets', {
   submittedAt: text('submitted_at').notNull(),
   ...timestamps,
 }, (table) => [
-  uniqueIndex('attendance_sheets_date_class_period_unique').on(table.schoolDate, table.classId, table.periodId),
-  index('attendance_sheets_class_date_idx').on(table.classId, table.schoolDate),
+  uniqueIndex('attendance_sheets_year_date_class_period_unique').on(table.schoolYearId, table.schoolDate, table.classId, table.periodId),
+  index('attendance_sheets_year_class_date_idx').on(table.schoolYearId, table.classId, table.schoolDate),
 ])
 
 export const attendanceEntries = sqliteTable('attendance_entries', {

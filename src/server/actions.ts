@@ -1,6 +1,6 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
-import type { AttendanceStatus, Notice, Workspace } from '../lib/types'
+import type { AttendanceStatus, Notice, SchoolYear, Workspace } from '../lib/types'
 import { adminMiddleware } from './auth'
 import { getRawDb } from './db'
 
@@ -17,6 +17,17 @@ function todayInTimeZone(timezone: string) {
 
 function classPeriodOwner(classId: string) {
   return `class:${classId}`
+}
+
+type SchoolYearRow = { id: string; name: string; start_date: string; end_date: string; active: number; archived: number }
+const mapSchoolYear = (year: SchoolYearRow): SchoolYear => ({ id: year.id, name: year.name, startDate: year.start_date, endDate: year.end_date, active: Boolean(year.active), archived: Boolean(year.archived) })
+async function getActiveSchoolYear(database: D1Database) {
+  const year = await database.prepare('SELECT id, name, start_date, end_date, active, archived FROM school_years WHERE active = 1 AND archived = 0 LIMIT 1').first<SchoolYearRow>()
+  if (!year) throw new Error('No active school year. Create or activate one in School years before continuing.')
+  return mapSchoolYear(year)
+}
+function assertDateInSchoolYear(date: string, schoolYear: SchoolYear) {
+  if (date < schoolYear.startDate || date > schoolYear.endDate) throw new Error(`Choose a date within the active school year (${schoolYear.startDate} through ${schoolYear.endDate}).`)
 }
 
 async function resolvedPeriods(database: D1Database, classId: string) {
@@ -40,16 +51,19 @@ export const getWorkspace = createServerFn({ method: 'GET' })
   .middleware([adminMiddleware])
   .handler(async (): Promise<Workspace> => {
     const database = getRawDb()
-    const [settingsResult, daysResult, periodResult, classResult, studentResult] = await database.batch([
+    const [settingsResult, daysResult, periodResult, classResult, studentResult, schoolYearResult] = await database.batch([
       database.prepare('SELECT name, timezone, notice_threshold, multi_period_enabled FROM school_settings WHERE id = 1'),
       database.prepare("SELECT weekday FROM meeting_days WHERE schedule_owner = 'school' AND enabled = 1 ORDER BY weekday"),
       database.prepare("SELECT id, name, start_time, end_time, sort_order, attendance_required FROM periods WHERE schedule_owner = 'school' AND active = 1 ORDER BY sort_order"),
       database.prepare('SELECT id, name, schedule_mode, active FROM classes ORDER BY name'),
-      database.prepare('SELECT id, display_name, class_id, active FROM students ORDER BY display_name'),
+      database.prepare('SELECT id, display_name, class_id, school_year_id, active FROM students ORDER BY display_name'),
+      database.prepare('SELECT id, name, start_date, end_date, active, archived FROM school_years ORDER BY start_date DESC'),
     ])
     const setting = rows<{ name: string; timezone: string; notice_threshold: number; multi_period_enabled: number }>(settingsResult)[0]
     if (!setting) throw new Error('School settings have not been initialized. Apply the D1 migration first.')
     const classes = rows<{ id: string; name: string; schedule_mode: 'inherit' | 'custom'; active: number }>(classResult)
+    const schoolYears = rows<SchoolYearRow>(schoolYearResult).map(mapSchoolYear)
+    const activeSchoolYear = schoolYears.find((year) => year.active && !year.archived) ?? null
     const loadedClasses = await Promise.all(classes.map(async (schoolClass) => ({
       id: schoolClass.id,
       name: schoolClass.name,
@@ -74,12 +88,15 @@ export const getWorkspace = createServerFn({ method: 'GET' })
         attendanceRequired: Boolean(period.attendance_required),
       })),
       classes: loadedClasses,
-      students: rows<{ id: string; display_name: string; class_id: string; active: number }>(studentResult).map((student) => ({
+      students: rows<{ id: string; display_name: string; class_id: string; school_year_id: string; active: number }>(studentResult).filter((student) => student.school_year_id === activeSchoolYear?.id).map((student) => ({
         id: student.id,
         displayName: student.display_name,
         classId: student.class_id,
+        schoolYearId: student.school_year_id,
         active: Boolean(student.active),
       })),
+      schoolYears,
+      activeSchoolYear,
     }
   })
 
@@ -88,7 +105,9 @@ export const getAttendanceSheet = createServerFn({ method: 'GET' })
   .validator(z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), classId: z.string().min(1), periodId: z.string().min(1) }))
   .handler(async ({ data }) => {
     const database = getRawDb()
-    const sheet = await database.prepare('SELECT id, submitted_at FROM attendance_sheets WHERE school_date = ? AND class_id = ? AND period_id = ?').bind(data.date, data.classId, data.periodId).first<{ id: string; submitted_at: string }>()
+    const schoolYear = await getActiveSchoolYear(database)
+    assertDateInSchoolYear(data.date, schoolYear)
+    const sheet = await database.prepare('SELECT id, submitted_at FROM attendance_sheets WHERE school_year_id = ? AND school_date = ? AND class_id = ? AND period_id = ?').bind(schoolYear.id, data.date, data.classId, data.periodId).first<{ id: string; submitted_at: string }>()
     if (!sheet) return { id: undefined, savedAt: undefined, entries: {} as Record<string, AttendanceStatus> }
     const entryRows = rows<{ student_id: string; status: AttendanceStatus }>(await database.prepare('SELECT student_id, status FROM attendance_entries WHERE sheet_id = ?').bind(sheet.id).all())
     return { id: sheet.id, savedAt: sheet.submitted_at, entries: Object.fromEntries(entryRows.map((entry) => [entry.student_id, entry.status])) }
@@ -104,7 +123,12 @@ export const saveAttendanceSheet = createServerFn({ method: 'POST' })
   }))
   .handler(async ({ data, context }) => {
     const database = getRawDb()
-    const students = rows<{ id: string }>(await database.prepare('SELECT id FROM students WHERE class_id = ? AND active = 1').bind(data.classId).all())
+    const schoolYear = await getActiveSchoolYear(database)
+    assertDateInSchoolYear(data.date, schoolYear)
+    const meetingDays = rows<{ weekday: number }>(await database.prepare("SELECT weekday FROM meeting_days WHERE schedule_owner = 'school' AND enabled = 1").all()).map((day) => day.weekday)
+    const weekday = new Date(`${data.date}T12:00:00Z`).getUTCDay()
+    if (!meetingDays.includes(weekday)) throw new Error('Attendance can only be saved for a scheduled school day.')
+    const students = rows<{ id: string }>(await database.prepare('SELECT id FROM students WHERE class_id = ? AND school_year_id = ? AND active = 1').bind(data.classId, schoolYear.id).all())
     const expected = students.map((student) => student.id).sort()
     const submitted = Object.keys(data.entries).sort()
     if (expected.length !== submitted.length || expected.some((student, index) => student !== submitted[index])) {
@@ -115,12 +139,12 @@ export const saveAttendanceSheet = createServerFn({ method: 'POST' })
     const sheetId = id()
     const now = new Date().toISOString()
     const statements: D1PreparedStatement[] = [
-      database.prepare(`INSERT INTO attendance_sheets (id, school_date, class_id, period_id, period_name, period_order, submitted_by_uid, submitted_by_email, submitted_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(school_date, class_id, period_id) DO UPDATE SET submitted_by_uid = excluded.submitted_by_uid, submitted_by_email = excluded.submitted_by_email, submitted_at = excluded.submitted_at, updated_at = excluded.updated_at`)
-        .bind(sheetId, data.date, data.classId, period.id, period.name, period.order, context.user.uid, context.user.email, now, now, now),
+      database.prepare(`INSERT INTO attendance_sheets (id, school_date, class_id, school_year_id, period_id, period_name, period_order, submitted_by_uid, submitted_by_email, submitted_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(school_year_id, school_date, class_id, period_id) DO UPDATE SET submitted_by_uid = excluded.submitted_by_uid, submitted_by_email = excluded.submitted_by_email, submitted_at = excluded.submitted_at, updated_at = excluded.updated_at`)
+        .bind(sheetId, data.date, data.classId, schoolYear.id, period.id, period.name, period.order, context.user.uid, context.user.email, now, now, now),
     ]
-    const existing = await database.prepare('SELECT id FROM attendance_sheets WHERE school_date = ? AND class_id = ? AND period_id = ?').bind(data.date, data.classId, data.periodId).first<{ id: string }>()
+    const existing = await database.prepare('SELECT id FROM attendance_sheets WHERE school_year_id = ? AND school_date = ? AND class_id = ? AND period_id = ?').bind(schoolYear.id, data.date, data.classId, data.periodId).first<{ id: string }>()
     const finalSheetId = existing?.id ?? sheetId
     for (const [studentId, status] of Object.entries(data.entries)) {
       statements.push(database.prepare(`INSERT INTO attendance_entries (id, sheet_id, student_id, status, created_at, updated_at)
@@ -137,12 +161,17 @@ export const saveStudent = createServerFn({ method: 'POST' })
   .validator(z.object({ id: z.string().optional(), displayName: z.string().trim().min(1).max(120), classId: z.string().min(1) }))
   .handler(async ({ data }) => {
     const database = getRawDb()
+    const schoolYear = await getActiveSchoolYear(database)
     const now = new Date().toISOString()
     const studentId = data.id ?? id()
-    await database.prepare(`INSERT INTO students (id, display_name, normalized_name, class_id, active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 1, ?, ?)
+    if (data.id) {
+      const existing = await database.prepare('SELECT id FROM students WHERE id = ? AND school_year_id = ?').bind(data.id, schoolYear.id).first()
+      if (!existing) throw new Error('That student is not part of the active school year.')
+    }
+    await database.prepare(`INSERT INTO students (id, display_name, normalized_name, class_id, school_year_id, active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?)
       ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name, normalized_name = excluded.normalized_name, class_id = excluded.class_id, active = 1, updated_at = excluded.updated_at`)
-      .bind(studentId, data.displayName.trim(), normalise(data.displayName), data.classId, now, now).run()
+      .bind(studentId, data.displayName.trim(), normalise(data.displayName), data.classId, schoolYear.id, now, now).run()
     return { id: studentId }
   })
 
@@ -151,7 +180,8 @@ export const archiveStudent = createServerFn({ method: 'POST' })
   .validator(z.object({ id: z.string().min(1), active: z.boolean() }))
   .handler(async ({ data }) => {
     const database = getRawDb()
-    await database.prepare('UPDATE students SET active = ?, updated_at = ? WHERE id = ?').bind(data.active ? 1 : 0, new Date().toISOString(), data.id).run()
+    const schoolYear = await getActiveSchoolYear(database)
+    await database.prepare('UPDATE students SET active = ?, updated_at = ? WHERE id = ? AND school_year_id = ?').bind(data.active ? 1 : 0, new Date().toISOString(), data.id, schoolYear.id).run()
     return { ok: true }
   })
 
@@ -216,6 +246,7 @@ export const importStudents = createServerFn({ method: 'POST' })
   .validator(z.object({ rows: z.array(z.object({ displayName: z.string().trim().min(1).max(120), classId: z.string().min(1) })).min(1).max(1000) }))
   .handler(async ({ data }) => {
     const database = getRawDb()
+    const schoolYear = await getActiveSchoolYear(database)
     const now = new Date().toISOString()
     const seen = new Set<string>()
     const uniqueRows = data.rows.filter((student) => {
@@ -224,36 +255,85 @@ export const importStudents = createServerFn({ method: 'POST' })
       seen.add(key)
       return true
     })
-    const existing = rows<{ normalized_name: string; class_id: string }>(await database.prepare('SELECT normalized_name, class_id FROM students').all())
+    const existing = rows<{ normalized_name: string; class_id: string }>(await database.prepare('SELECT normalized_name, class_id FROM students WHERE school_year_id = ?').bind(schoolYear.id).all())
     const existingKeys = new Set(existing.map((student) => `${student.class_id}:${student.normalized_name}`))
     const accepted = uniqueRows.filter((student) => !existingKeys.has(`${student.classId}:${normalise(student.displayName)}`))
-    await database.batch(accepted.map((student) => database.prepare('INSERT INTO students (id, display_name, normalized_name, class_id, active, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)')
-      .bind(id(), student.displayName.trim(), normalise(student.displayName), student.classId, now, now)))
+    await database.batch(accepted.map((student) => database.prepare('INSERT INTO students (id, display_name, normalized_name, class_id, school_year_id, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)')
+      .bind(id(), student.displayName.trim(), normalise(student.displayName), student.classId, schoolYear.id, now, now)))
     return { created: accepted.length, skipped: data.rows.length - accepted.length }
+  })
+
+export const createSchoolYear = createServerFn({ method: 'POST' })
+  .middleware([adminMiddleware])
+  .validator(z.object({
+    name: z.string().trim().min(1).max(64),
+    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  }))
+  .handler(async ({ data }) => {
+    if (data.startDate > data.endDate) throw new Error('The school year end date must be after its start date.')
+    const database = getRawDb()
+    const overlap = await database.prepare('SELECT name FROM school_years WHERE NOT (end_date < ? OR start_date > ?) LIMIT 1').bind(data.startDate, data.endDate).first<{ name: string }>()
+    if (overlap) throw new Error(`Those dates overlap ${overlap.name}. School years cannot overlap.`)
+    const now = new Date().toISOString()
+    const schoolYearId = id()
+    await database.prepare('INSERT INTO school_years (id, name, start_date, end_date, active, archived, created_at, updated_at) VALUES (?, ?, ?, ?, 0, 0, ?, ?)')
+      .bind(schoolYearId, data.name.trim(), data.startDate, data.endDate, now, now).run()
+    return { id: schoolYearId }
+  })
+
+export const activateSchoolYear = createServerFn({ method: 'POST' })
+  .middleware([adminMiddleware])
+  .validator(z.object({ id: z.string().min(1) }))
+  .handler(async ({ data }) => {
+    const database = getRawDb()
+    const target = await database.prepare('SELECT id FROM school_years WHERE id = ? AND archived = 0').bind(data.id).first()
+    if (!target) throw new Error('Archived school years cannot be activated.')
+    const now = new Date().toISOString()
+    await database.batch([
+      database.prepare('UPDATE school_years SET active = 0, updated_at = ? WHERE active = 1').bind(now),
+      database.prepare('UPDATE school_years SET active = 1, updated_at = ? WHERE id = ?').bind(now, data.id),
+    ])
+    return { ok: true }
+  })
+
+export const archiveSchoolYear = createServerFn({ method: 'POST' })
+  .middleware([adminMiddleware])
+  .validator(z.object({ id: z.string().min(1), confirmed: z.literal(true) }))
+  .handler(async ({ data }) => {
+    const database = getRawDb()
+    const now = new Date().toISOString()
+    const result = await database.prepare('UPDATE school_years SET active = 0, archived = 1, archived_at = ?, updated_at = ? WHERE id = ? AND archived = 0').bind(now, now, data.id).run()
+    if (!result.meta.changes) throw new Error('That school year is already archived or no longer exists.')
+    return { ok: true }
   })
 
 export const getNotices = createServerFn({ method: 'GET' })
   .middleware([adminMiddleware])
   .handler(async (): Promise<Notice[]> => {
     const database = getRawDb()
+    const schoolYear = await getActiveSchoolYear(database)
     const settings = await database.prepare('SELECT timezone, notice_threshold FROM school_settings WHERE id = 1').first<{ timezone: string; notice_threshold: number }>()
     if (!settings) throw new Error('School settings have not been initialized.')
     const [dayResult, classResult, studentResult] = await database.batch([
       database.prepare("SELECT weekday FROM meeting_days WHERE schedule_owner = 'school' AND enabled = 1"),
       database.prepare('SELECT id, name FROM classes WHERE active = 1'),
-      database.prepare('SELECT id, display_name, class_id FROM students WHERE active = 1'),
+      database.prepare('SELECT id, display_name, class_id FROM students WHERE school_year_id = ? AND active = 1').bind(schoolYear.id),
     ])
     const workspace = {
       school: { timezone: settings.timezone, noticeThreshold: settings.notice_threshold, meetingDays: rows<{ weekday: number }>(dayResult).map((day) => day.weekday) },
       classes: rows<{ id: string; name: string }>(classResult),
       students: rows<{ id: string; display_name: string; class_id: string }>(studentResult).map((student) => ({ id: student.id, displayName: student.display_name, classId: student.class_id, active: true })),
     }
-    const today = todayInTimeZone(workspace.school.timezone)
+    const currentDate = todayInTimeZone(workspace.school.timezone)
+    if (currentDate < schoolYear.startDate) return []
+    const today = currentDate > schoolYear.endDate ? schoolYear.endDate : currentDate
     const start = new Date(`${today}T00:00:00Z`)
     start.setUTCDate(start.getUTCDate() - 45)
-    const earliest = start.toISOString().slice(0, 10)
+    const earliestCandidate = start.toISOString().slice(0, 10)
+    const earliest = earliestCandidate < schoolYear.startDate ? schoolYear.startDate : earliestCandidate
     const records = rows<{ school_date: string; student_id: string; status: AttendanceStatus; period_id: string; class_id: string }>(await database.prepare(`SELECT s.school_date, e.student_id, e.status, s.period_id, s.class_id
-      FROM attendance_sheets s JOIN attendance_entries e ON e.sheet_id = s.id WHERE s.school_date >= ? AND s.school_date <= ?`).bind(earliest, today).all())
+      FROM attendance_sheets s JOIN attendance_entries e ON e.sheet_id = s.id WHERE s.school_year_id = ? AND s.school_date >= ? AND s.school_date <= ?`).bind(schoolYear.id, earliest, today).all())
     const classById = new Map(workspace.classes.map((item) => [item.id, item]))
     const notices: Notice[] = []
     for (const student of workspace.students.filter((item) => item.active)) {

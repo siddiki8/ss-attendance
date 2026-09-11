@@ -16,8 +16,8 @@
 		"db:migrate:local": "wrangler d1 migrations apply ss-attendance --local",
 		"db:migrate:remote": "wrangler d1 migrations apply ss-attendance --remote",
 		"test": "vitest run --config vitest.config.ts",
-		"admin:grant": "node scripts/set-admin-claim.mjs grant",
-		"admin:revoke": "node scripts/set-admin-claim.mjs revoke"
+		"admin:grant": "node --env-file=.env.local scripts/set-admin-claim.mjs grant",
+		"admin:revoke": "node --env-file=.env.local scripts/set-admin-claim.mjs revoke"
 	},
 	"dependencies": {
 		"@tailwindcss/vite": "^4.1.18",

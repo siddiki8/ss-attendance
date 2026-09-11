@@ -25,7 +25,17 @@ export type Student = {
   id: string
   displayName: string
   classId: string
+  schoolYearId: string
   active: boolean
+}
+
+export type SchoolYear = {
+  id: string
+  name: string
+  startDate: string
+  endDate: string
+  active: boolean
+  archived: boolean
 }
 
 export type AttendanceSheet = {
@@ -56,4 +66,6 @@ export type Workspace = {
   periods: Period[]
   classes: SchoolClass[]
   students: Student[]
+  schoolYears: SchoolYear[]
+  activeSchoolYear: SchoolYear | null
 }

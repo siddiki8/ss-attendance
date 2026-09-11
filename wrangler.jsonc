@@ -18,7 +18,7 @@
 		{
 			"binding": "DB",
 			"database_name": "ss-attendance",
-			"database_id": "00000000-0000-0000-0000-000000000000",
+			"database_id": "e5218c1c-efa3-43bf-b511-7c2a8a3d4d33",
 			"migrations_dir": "drizzle"
 		}
 	]
